@@ -1,0 +1,18 @@
+[package]
+name = "byte_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.68"
+futures = "0.3.28"
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0.163", features = ["derive"] }
+serde_json = "1.0.96"
+thiserror = "1.0.40"
+tokio = { version = "1.28.1", features = ["full"] }
+tokio-tungstenite = { version = "0.19.0", features = ["native-tls"]}
+
+[dev-dependencies]
+rand = "0.8.5"
+rand_chacha = "0.3.1"
