@@ -1,9 +1,12 @@
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 
 use async_trait::async_trait;
 use futures::{future, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::Connection;
@@ -11,7 +14,6 @@ use super::ConnectionStream;
 use super::Error;
 use super::Order;
 use super::OrderDetails;
-use tokio::io::AsyncReadExt;
 
 /// A connection to Binance for the specified symbol
 pub struct BinanceConnection {
@@ -39,27 +41,58 @@ impl Connection for BinanceConnection {
         );
 
         // Start the stream
-        let delta_stream = stream(&stream_url).await?;
+        let mut delta_stream = stream(&stream_url).await?;
+        let mut delta_buffer = VecDeque::new();
 
-        // Fetch the snapshot
-        let snapshot = snapshot(&snapshot_url).await?;
+        let snapshot = loop {
+            tokio::select! {
+                delta_result = delta_stream.next() => {
+                    match delta_result {
+                        Some(Ok(delta)) => delta_buffer.push_back(delta),
+                        Some(Err(e)) => {
+                            break Err(Error::from(e));
+                        }
+                        None => {
+                            break Err(Error::Stream(TungsteniteError::ConnectionClosed));
+                        }
+                    }
+                }
+                snapshot_result = snapshot(&snapshot_url) => {
+                    break snapshot_result;
+                }
+            }
+        }?;
+
+        // Drop any buffered deltas that predate the snapshot.
         let last_updated = snapshot.last_update_id;
+        while let Some(delta) = delta_buffer.front() {
+            if delta.last_update <= last_updated {
+                delta_buffer.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // If there is a buffered delta, check the update times.
+        if let Some(delta) = delta_buffer.front() {
+            if delta.first_update > last_updated + 1 || delta.last_update < last_updated + 1 {
+                return Err(Error::UnexpectedItem(format!(
+                    "Bad update bounds: {}, {:?}",
+                    last_updated + 1,
+                    delta
+                )));
+            }
+        }
 
         // Convert to order stream
         let snapshot_orders: Vec<Order> = snapshot.try_into()?;
         let snapshot_stream =
             futures::stream::iter(snapshot_orders.into_iter().map(|order| Ok(order)));
 
-        // Predicate to filter too-old deltas from delta stream
-        let predicate = move |result: &Result<Delta, Error>| {
-            future::ready(match result {
-                Ok(delta) => delta.last_update <= last_updated,
-                Err(_) => false,
-            })
-        };
-
-        let delta_stream = delta_stream.skip_while(predicate);
-
+        // Convert buffered deltas to stream and chain with live stream
+        let buffer_stream =
+            futures::stream::iter(delta_buffer.into_iter().map(|d| Ok::<_, Error>(d)));
+        let delta_stream = buffer_stream.chain(delta_stream);
         let deltas = delta_stream
             .map(|result| match result {
                 Ok(delta) => {
